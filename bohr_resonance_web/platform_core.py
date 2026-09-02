@@ -27,6 +27,7 @@ from damping_analysis.analyze_damping import (
     calculate_current_squared,
     fit_damping_model,
 )
+from decay_analysis.analyze_decay import DecayFitResult, fit_decay_model, load_decay_csv
 from forced_analysis.analyze_forced import (
     calculate_frequency_ratio,
     calculate_phase_difference,
@@ -53,6 +54,15 @@ class ForcedPlatformResult:
     amplitude_max: float
     amplitude_png: bytes
     phase_png: bytes
+    processed_csv: bytes
+
+
+@dataclass(frozen=True)
+class DecayPlatformResult:
+    source_name: str
+    processed: pd.DataFrame
+    fit: DecayFitResult
+    plot_png: bytes
     processed_csv: bytes
 
 
@@ -103,6 +113,64 @@ def _figure_bytes(fig: plt.Figure) -> bytes:
 
 def _csv_bytes(frame: pd.DataFrame) -> bytes:
     return frame.to_csv(index=False).encode("utf-8-sig")
+
+
+def _decay_plot(data: pd.DataFrame, fit: DecayFitResult) -> bytes:
+    configure_matplotlib_chinese_font()
+    time_s = data["elapsed_time_s"].to_numpy(dtype=float)
+    measured = data["amplitude_deg"].to_numpy(dtype=float)
+    fitted = data["fit_amplitude_deg"].to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=(9.2, 5.8))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#FBFDFF")
+    ax.scatter(time_s, measured, s=10, color="#2563A6", alpha=0.72,
+               edgecolors="none", zorder=2, label="实验数据")
+    ax.plot(time_s, fitted, color="#D55E00", linewidth=2.2, zorder=3,
+            label="阻尼正弦拟合")
+
+    equation = (
+        r"$A(t)=C+A_0e^{-\beta t}\sin(\omega t+\varphi)$"
+        "\n"
+        + rf"$A_0={fit.amplitude_A:.4f}\pm{fit.amplitude_A_error:.4f}$ deg"
+        "\n"
+        + rf"$\beta={fit.beta:.6f}\pm{fit.beta_error:.6f}$ s$^{{-1}}$"
+        "\n"
+        + rf"$\omega={fit.omega:.6f}\pm{fit.omega_error:.6f}$ rad/s"
+        "\n"
+        + rf"$\varphi={fit.phase_phi:.6f}\pm{fit.phase_phi_error:.6f}$ rad"
+        "\n"
+        + rf"$C={fit.offset_C:.4f}\pm{fit.offset_C_error:.4f}$ deg"
+        "\n"
+        + rf"RMSE={fit.rmse:.4f} deg, $R^2={fit.r_squared:.6f}$"
+    )
+    ax.text(0.985, 0.96, equation, transform=ax.transAxes, ha="right", va="top",
+            fontsize=9.5, linespacing=1.35,
+            bbox={"boxstyle": "round,pad=0.5", "facecolor": "white",
+                  "edgecolor": "#B9D4F0", "alpha": 0.96})
+    ax.set_xlabel("时间 t (s)", fontsize=12)
+    ax.set_ylabel("振幅角度 A (deg)", fontsize=12)
+    ax.set_title("阻尼振动时域曲线拟合", fontsize=15, pad=14, color="#123A63")
+    ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35, color="#8EAFCB")
+    ax.legend(frameon=True, facecolor="white", loc="lower right")
+    for spine in ax.spines.values():
+        spine.set_color("#B8CDE0")
+    fig.tight_layout()
+    return _figure_bytes(fig)
+
+
+def analyze_decay_upload(payload: bytes, file_name: str) -> DecayPlatformResult:
+    processed, fit = fit_decay_model(load_decay_csv(payload, file_name))
+    export = processed[[
+        "time_s", "elapsed_time_s", "amplitude_deg", "fit_amplitude_deg", "residual_deg"
+    ]].copy()
+    return DecayPlatformResult(
+        source_name=file_name,
+        processed=export,
+        fit=fit,
+        plot_png=_decay_plot(processed, fit),
+        processed_csv=_csv_bytes(export),
+    )
 
 
 def _damping_plot(data: pd.DataFrame, fit: DampingFitResult) -> bytes:

@@ -7,8 +7,10 @@ from pathlib import Path
 import streamlit as st
 
 from platform_core import (
+    DecayPlatformResult,
     DampingPlatformResult,
     ForcedPlatformResult,
+    analyze_decay_upload,
     analyze_damping_upload,
     analyze_forced_upload,
     build_zip,
@@ -26,6 +28,7 @@ st.set_page_config(
 PROJECT_ROOT = Path(__file__).resolve().parent
 DAMPING_DEMO = PROJECT_ROOT / "damping_analysis" / "data" / "阻尼电流原始数据.xlsx"
 FORCED_DEMO = PROJECT_ROOT / "forced_analysis" / "data" / "受迫振动原始数据.xlsx"
+DECAY_DEMO = PROJECT_ROOT / "decay_analysis" / "data" / "100.csv"
 
 
 def apply_styles() -> None:
@@ -84,7 +87,7 @@ def show_header() -> None:
         """
         <div class="hero">
           <h1>BohrLab · 波尔共振数据处理平台</h1>
-          <p>上传原始 Excel，一键完成参数计算、曲线绘制与图片导出。全部数据仅在本机处理。</p>
+          <p>上传原始 Excel 或 CSV，一键完成参数计算、曲线拟合与结果导出。全部数据仅在当前会话处理。</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -97,7 +100,7 @@ def show_sidebar() -> None:
         st.markdown(
             """
             1. 选择分析模式  
-            2. 上传 `.xlsx` 原始表格  
+            2. 上传 `.xlsx` 或 `.csv` 原始数据  
             3. 点击“生成分析图”  
             4. 在右侧预览并下载
             """
@@ -106,6 +109,7 @@ def show_sidebar() -> None:
         st.markdown("#### 表头要求")
         st.caption("阻尼电流：`Id(A)`、`β`")
         st.caption("受迫振动：`受迫频率（Hz)`、`角频率ω`、`振幅θ`")
+        st.caption("阻尼振动曲线：`时间(s)`、`角度(°)`；角速度列会被忽略")
         st.divider()
         st.caption("原始文件不会被修改。计算结果只在当前页面会话中保存。")
 
@@ -335,13 +339,99 @@ def forced_page() -> None:
             st.dataframe(result.processed, hide_index=True, width="stretch")
 
 
+def decay_page() -> None:
+    left, right = st.columns([0.92, 1.48], gap="large")
+    with left:
+        st.markdown('<div class="section-title">01 · 放入阻尼振动时域数据</div>', unsafe_allow_html=True)
+        uploaded = st.file_uploader(
+            "阻尼振动原始数据",
+            type=["csv"],
+            key="decay_upload",
+            help="CSV 需包含时间和角度/振幅列；设备元数据行可保留。",
+        )
+        use_demo = st.checkbox("使用平台内置示例数据", key="decay_demo")
+        if uploaded is not None:
+            st.markdown(
+                f'<div class="status-note">已选择：{uploaded.name}<br>大小：{uploaded.size / 1024:.1f} KB</div>',
+                unsafe_allow_html=True,
+            )
+        generate = st.button(
+            "确认并生成阻尼拟合图",
+            type="primary",
+            width="stretch",
+            disabled=uploaded is None and not use_demo,
+            key="generate_decay",
+        )
+        if generate:
+            try:
+                with st.spinner("正在识别频率并执行非线性最小二乘拟合……"):
+                    if use_demo:
+                        payload, source_name = DECAY_DEMO.read_bytes(), DECAY_DEMO.name
+                    else:
+                        assert uploaded is not None
+                        payload, source_name = uploaded.getvalue(), uploaded.name
+                    st.session_state["decay_result"] = analyze_decay_upload(payload, source_name)
+                st.success("阻尼振动曲线拟合完成。")
+            except Exception as exc:
+                st.session_state.pop("decay_result", None)
+                st.error(str(exc))
+
+        st.markdown("##### 拟合方程")
+        st.latex(r"A(t)=C+A_0e^{-\beta t}\sin(\omega t+\varphi)")
+        st.caption("β 为阻尼系数；仅使用时间和角度/振幅两列，角速度列不读取、不校验。")
+
+    with right:
+        st.markdown('<div class="section-title">02 · 拟合结果与导出</div>', unsafe_allow_html=True)
+        result: DecayPlatformResult | None = st.session_state.get("decay_result")
+        if result is None:
+            st.markdown(
+                '<div class="placeholder">阻尼振动拟合图将在这里显示<br>请上传 CSV 或使用内置示例数据</div>',
+                unsafe_allow_html=True,
+            )
+            return
+
+        primary_metrics = st.columns(3)
+        primary_metrics[0].metric("阻尼系数 β", f"{result.fit.beta:.6f} s⁻¹")
+        primary_metrics[1].metric("角频率 ω", f"{result.fit.omega:.6f} rad/s")
+        primary_metrics[2].metric("决定系数 R²", f"{result.fit.r_squared:.6f}")
+        secondary_metrics = st.columns(3)
+        secondary_metrics[0].metric("初始振幅 A₀", f"{result.fit.amplitude_A:.4f}°")
+        secondary_metrics[1].metric("初相位 φ", f"{result.fit.phase_phi:.6f} rad")
+        secondary_metrics[2].metric("平衡位置 C", f"{result.fit.offset_C:.4f}°")
+        st.caption(f"均方根误差 RMSE = {result.fit.rmse:.4f}°")
+
+        preview_cols = st.columns([0.12, 0.76, 0.12])
+        with preview_cols[1]:
+            st.image(result.plot_png, width="stretch")
+
+        zip_bytes = build_zip({
+            "04_阻尼振动时域拟合图.png": result.plot_png,
+            "阻尼振动拟合结果.csv": result.processed_csv,
+        })
+        download_cols = st.columns(3)
+        download_cols[0].download_button(
+            "下载拟合图 PNG", result.plot_png, "04_阻尼振动时域拟合图.png", "image/png",
+            width="stretch",
+        )
+        download_cols[1].download_button(
+            "下载拟合数据 CSV", result.processed_csv, "阻尼振动拟合结果.csv", "text/csv",
+            width="stretch",
+        )
+        download_cols[2].download_button(
+            "打包下载 ZIP", zip_bytes, "阻尼振动拟合结果.zip", "application/zip",
+            width="stretch",
+        )
+        with st.expander("查看拟合数据与残差"):
+            st.dataframe(result.processed, hide_index=True, width="stretch")
+
+
 apply_styles()
 show_header()
 show_sidebar()
 
 mode = st.radio(
     "分析模式",
-    ["阻尼电流模式", "受迫振动模式"],
+    ["阻尼电流模式", "受迫振动模式", "阻尼振动拟合模式"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -349,5 +439,7 @@ st.divider()
 
 if mode == "阻尼电流模式":
     damping_page()
-else:
+elif mode == "受迫振动模式":
     forced_page()
+else:
+    decay_page()
